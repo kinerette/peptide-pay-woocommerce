@@ -1,0 +1,8 @@
+wp-content/
+*.log
+vendor/
+node_modules/
+.DS_Store
+.idea/
+.vscode/
+*.zip

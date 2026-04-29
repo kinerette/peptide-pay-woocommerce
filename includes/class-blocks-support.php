@@ -1,0 +1,71 @@
+<?php
+/**
+ * Peptide-Pay — WooCommerce Blocks (Cart/Checkout) support.
+ *
+ * Registers every Peptide-Pay sub-gateway as a payment method type so they
+ * appear on block-based checkouts. Single class instanced N times (one per
+ * sub-gateway) — no duplication.
+ *
+ * @package Peptide_Pay
+ */
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+use Automattic\WooCommerce\Blocks\Payments\Integrations\AbstractPaymentMethodType;
+
+class Peptide_Pay_Blocks_Support extends AbstractPaymentMethodType {
+
+	/** @var string WC_Payment_Gateway subclass name. */
+	protected $gateway_class;
+
+	/** @var WC_Gateway_Peptide_Pay_Base */
+	protected $gateway;
+
+	public function __construct( $gateway_class ) {
+		$this->gateway_class = $gateway_class;
+		$this->gateway       = new $gateway_class();
+		// Name MUST match the gateway's ID so WC Blocks pairs them correctly.
+		$this->name = $this->gateway->id;
+	}
+
+	public function initialize() {
+		// Settings are already loaded by the gateway instance; nothing extra here.
+	}
+
+	public function is_active() {
+		return 'yes' === $this->gateway->enabled;
+	}
+
+	public function get_payment_method_script_handles() {
+		// A single shared JS file registers every gateway via the server-side
+		// config data we inject below. Keeps bundle size minimal (~1KB).
+		$handle = 'peptide-pay-blocks';
+		if ( ! wp_script_is( $handle, 'registered' ) ) {
+			wp_register_script(
+				$handle,
+				PEPTIDE_PAY_URL . 'assets/js/blocks-support.js',
+				array( 'wc-blocks-registry', 'wp-element', 'wp-html-entities', 'wp-i18n' ),
+				PEPTIDE_PAY_VERSION,
+				true
+			);
+		}
+		return array( $handle );
+	}
+
+	public function get_payment_method_data() {
+		$icon = '';
+		if ( method_exists( $this->gateway, 'get_icon' ) ) {
+			// Prefer the HTML icon if WC has built one (wraps <img>), otherwise raw URL.
+			$icon = $this->gateway->icon ? (string) $this->gateway->icon : '';
+		}
+		return array(
+			'id'          => $this->gateway->id,
+			'title'       => $this->gateway->get_title(),
+			'description' => $this->gateway->get_description(),
+			'icon'        => $icon,
+			'supports'    => array( 'products' ),
+		);
+	}
+}

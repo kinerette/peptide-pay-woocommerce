@@ -1,0 +1,82 @@
+# Copyright (C) 2026 Peptide-Pay
+# This file is distributed under the MIT license.
+msgid ""
+msgstr ""
+"Project-Id-Version: Peptide-Pay for WooCommerce 2.1.0\n"
+"Report-Msgid-Bugs-To: https://peptide-pay.com/support\n"
+"POT-Creation-Date: 2026-04-27 00:00+0000\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language-Team: LANGUAGE <hi@peptide-pay.com>\n"
+"Language: \n"
+"X-Generator: Peptide-Pay 2.1.0\n"
+
+msgid "Peptide-Pay"
+msgstr ""
+
+msgid "Enable/Disable"
+msgstr ""
+
+msgid "Enable Peptide-Pay at checkout"
+msgstr ""
+
+msgid "Title"
+msgstr ""
+
+msgid "Label shown to the customer at checkout."
+msgstr ""
+
+msgid "Credit / Debit Card"
+msgstr ""
+
+msgid "Description"
+msgstr ""
+
+msgid "Message shown below the title at checkout."
+msgstr ""
+
+msgid "Setup type"
+msgstr ""
+
+msgid "Quick — just paste my wallet (no signup)"
+msgstr ""
+
+msgid "Advanced — API key + HMAC webhooks"
+msgstr ""
+
+msgid "Your USDC Polygon wallet (Quick mode)"
+msgstr ""
+
+msgid "API Key (Advanced mode)"
+msgstr ""
+
+msgid "Webhook Secret (Advanced mode)"
+msgstr ""
+
+msgid "Default currency (Advanced mode)"
+msgstr ""
+
+msgid "Debug log"
+msgstr ""
+
+msgid "Log API requests to WooCommerce > Status > Logs"
+msgstr ""
+
+msgid "Peptide-Pay requires WooCommerce to be installed and active."
+msgstr ""
+
+msgid "Order not found."
+msgstr ""
+
+msgid "Peptide-Pay is not configured: missing wallet. Contact the shop admin."
+msgstr ""
+
+msgid "Peptide-Pay is not configured: missing API key."
+msgstr ""
+
+msgid "Unable to reach payment provider. Please try again."
+msgstr ""
+
+msgid "Awaiting Peptide-Pay payment."
+msgstr ""
