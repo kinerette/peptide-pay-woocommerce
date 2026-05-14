@@ -84,21 +84,29 @@ add_action( 'before_woocommerce_init', function () {
  * @return array<string,string> class name → provider_code
  */
 function peptide_pay_class_to_code() {
+	// Providers removed from this map because they are in PROVIDER_BLACKLIST
+	// on the peptide-pay server side and will never appear in the live API
+	// response. Keeping them here caused a dangerous fallback: when the live
+	// API was unreachable the plugin registered ALL local classes, making dead
+	// providers (binance, revolut, rampnetwork, sardine, alchemypay) visible
+	// to customers at checkout.
+	//
+	// Removed (server-side PROVIDER_BLACKLIST — see paygate.ts):
+	//   WC_Gateway_Peptide_Pay_Binance     — Binance Connect shut down Aug 2023
+	//   WC_Gateway_Peptide_Pay_Revolut     — deep-link broken (zero balance)
+	//   WC_Gateway_Peptide_Pay_RampNetwork — settles ETH mainnet, fund-loss risk
+	//   WC_Gateway_Peptide_Pay_Sardine     — hardcodes fixed_network=ethereum
+	//   WC_Gateway_Peptide_Pay_Alchemypay  — settles ETH mainnet via Trust Wallet
 	return array(
-		'WC_Gateway_Peptide_Pay_Smart'       => 'gateway',
-		'WC_Gateway_Peptide_Pay_Moonpay'     => 'moonpay',
-		'WC_Gateway_Peptide_Pay_Revolut'     => 'revolut',
-		'WC_Gateway_Peptide_Pay_Cryptocom'   => 'cryptocom',
-		'WC_Gateway_Peptide_Pay_Binance'     => 'binance',
-		'WC_Gateway_Peptide_Pay_Banxa'       => 'banxa',
-		'WC_Gateway_Peptide_Pay_Transak'     => 'transak',
-		'WC_Gateway_Peptide_Pay_RampNetwork' => 'rampnetwork',
-		'WC_Gateway_Peptide_Pay_Sardine'     => 'sardine',
-		'WC_Gateway_Peptide_Pay_Bitnovo'     => 'bitnovo',
-		'WC_Gateway_Peptide_Pay_Simplex'     => 'simplex',
-		'WC_Gateway_Peptide_Pay_Alchemypay'  => 'alchemypay',
-		'WC_Gateway_Peptide_Pay_Interac'     => 'interac',
-		'WC_Gateway_Peptide_Pay_Upi'         => 'upi',
+		'WC_Gateway_Peptide_Pay_Smart'   => 'gateway',
+		'WC_Gateway_Peptide_Pay_Moonpay' => 'moonpay',
+		'WC_Gateway_Peptide_Pay_Cryptocom' => 'cryptocom',
+		'WC_Gateway_Peptide_Pay_Banxa'   => 'banxa',
+		'WC_Gateway_Peptide_Pay_Transak' => 'transak',
+		'WC_Gateway_Peptide_Pay_Bitnovo' => 'bitnovo',
+		'WC_Gateway_Peptide_Pay_Simplex' => 'simplex',
+		'WC_Gateway_Peptide_Pay_Interac' => 'interac',
+		'WC_Gateway_Peptide_Pay_Upi'     => 'upi',
 	);
 }
 
