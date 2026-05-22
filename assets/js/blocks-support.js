@@ -1,39 +1,60 @@
 /**
- * Peptide-Pay — WooCommerce Blocks checkout integration.
+ * Peptide-Pay — WooCommerce Blocks (Cart/Checkout) integration.
  *
- * Reads each sub-gateway's registration data from wc.wcSettings
- * (keyed by gateway ID), and registers a payment method with the
- * WC Blocks registry. Single file, handles all 19 gateways.
+ * For each Peptide-Pay sub-gateway, the PHP AbstractPaymentMethodType injects
+ * its registration data under the standard `<id>_data` key (read via
+ * wc.wcSettings.getSetting) and appends its id to `window.peptidePayBlockIds`
+ * (inline, before this file). We register each one with the Blocks registry.
+ *
+ * NOTE (2026-05-22 fix): the previous version iterated
+ * `wc.wcSettings.ALL_SETTINGS_DATA` — that property does NOT exist in the WC
+ * settings API, so the loop never ran and registerPaymentMethod() was never
+ * called → Peptide-Pay was invisible on Blocks-based checkouts. Now driven by
+ * the explicit id list + the documented getSetting('<id>_data') accessor.
  */
 (function () {
-	if (!window.wp || !window.wc) return;
+	if (
+		!window.wp ||
+		!window.wc ||
+		!window.wc.wcBlocksRegistry ||
+		!window.wc.wcSettings ||
+		!window.wp.element
+	) {
+		return;
+	}
 
 	const { registerPaymentMethod } = window.wc.wcBlocksRegistry;
 	const { getSetting } = window.wc.wcSettings;
 	const { createElement, RawHTML } = window.wp.element;
-	const { decodeEntities } = window.wp.htmlEntities;
+	const decodeEntities =
+		(window.wp.htmlEntities && window.wp.htmlEntities.decodeEntities) || function (s) { return s; };
 
-	// Every sub-gateway ID follows `peptide_pay_<provider>` and each ships
-	// its data under `<id>_data` in wc.wcSettings.
-	const allSettings = (window.wc.wcSettings && window.wc.wcSettings.ALL_SETTINGS_DATA) || {};
-	Object.keys(allSettings).forEach((key) => {
-		if (!key.startsWith('peptide_pay_') || !key.endsWith('_data')) return;
+	// De-duped list of gateway ids injected by the PHP side (one inline line
+	// per registered sub-gateway).
+	const ids = (window.peptidePayBlockIds || []).filter(function (v, i, a) {
+		return v && a.indexOf(v) === i;
+	});
 
-		const data = getSetting(key);
-		if (!data || !data.id) return;
+	ids.forEach(function (id) {
+		const data = getSetting(id + '_data', null);
+		if (!data || !data.id) {
+			return;
+		}
 
-		const Label = () => createElement(
-			'span',
-			{ style: { display: 'flex', alignItems: 'center', gap: '8px' } },
-			data.icon ? createElement('img', { src: data.icon, alt: '', style: { maxHeight: '24px' } }) : null,
-			createElement('span', null, decodeEntities(data.title || ''))
-		);
+		const Label = function () {
+			return createElement(
+				'span',
+				{ style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+				data.icon
+					? createElement('img', { src: data.icon, alt: '', style: { maxHeight: '24px' } })
+					: null,
+				createElement('span', null, decodeEntities(data.title || ''))
+			);
+		};
 
-		const Content = () => createElement(
-			RawHTML,
-			null,
-			decodeEntities(data.description || '')
-		);
+		const Content = function () {
+			return createElement(RawHTML, null, decodeEntities(data.description || ''));
+		};
 
 		registerPaymentMethod({
 			name: data.id,
@@ -41,8 +62,8 @@
 			ariaLabel: decodeEntities(data.title || data.id),
 			content: createElement(Content),
 			edit: createElement(Content),
-			canMakePayment: () => true,
-			supports: { features: data.supports || ['products'] },
+			canMakePayment: function () { return true; },
+			supports: { features: (data.supports && data.supports.length) ? data.supports : ['products'] },
 		});
 	});
 })();

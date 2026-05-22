@@ -39,18 +39,27 @@ class Peptide_Pay_Blocks_Support extends AbstractPaymentMethodType {
 	}
 
 	public function get_payment_method_script_handles() {
-		// A single shared JS file registers every gateway via the server-side
-		// config data we inject below. Keeps bundle size minimal (~1KB).
+		// A single shared JS file registers every gateway. WC Blocks calls this
+		// method once per active payment method type, so we append each
+		// gateway's id to a JS global (`window.peptidePayBlockIds`) inline —
+		// the shared script then reads each gateway's data via the standard
+		// getSetting('<id>_data') accessor and registers it. `wc-settings` is a
+		// required dep so window.wc.wcSettings is guaranteed before the script.
 		$handle = 'peptide-pay-blocks';
 		if ( ! wp_script_is( $handle, 'registered' ) ) {
 			wp_register_script(
 				$handle,
 				PEPTIDE_PAY_URL . 'assets/js/blocks-support.js',
-				array( 'wc-blocks-registry', 'wp-element', 'wp-html-entities', 'wp-i18n' ),
+				array( 'wc-blocks-registry', 'wc-settings', 'wp-element', 'wp-html-entities', 'wp-i18n' ),
 				PEPTIDE_PAY_VERSION,
 				true
 			);
 		}
+		wp_add_inline_script(
+			$handle,
+			'window.peptidePayBlockIds=(window.peptidePayBlockIds||[]).concat(' . wp_json_encode( $this->gateway->id ) . ');',
+			'before'
+		);
 		return array( $handle );
 	}
 

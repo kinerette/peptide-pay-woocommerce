@@ -3,7 +3,7 @@
  * Plugin Name: Peptide-Pay for WooCommerce
  * Plugin URI: https://peptide-pay.com/download/woocommerce
  * Description: Accept Apple Pay, Google Pay, cards, Revolut + 11 more rails on your WooCommerce store — designed for peptides, nutra, and other high-risk merchants. 14 payment gateways in one plugin, kept in sync with the live PayGate provider list. Instant USDC payouts.
- * Version: 2.6.3
+ * Version: 2.6.4
  * Author: Peptide-Pay
  * Author URI: https://peptide-pay.com
  * License: MIT
@@ -29,7 +29,7 @@ if ( version_compare( PHP_VERSION, '7.4', '<' ) ) {
 	return;
 }
 
-define( 'PEPTIDE_PAY_VERSION', '2.6.3' );
+define( 'PEPTIDE_PAY_VERSION', '2.6.4' );
 define( 'PEPTIDE_PAY_FILE', __FILE__ );
 define( 'PEPTIDE_PAY_PATH', plugin_dir_path( __FILE__ ) );
 define( 'PEPTIDE_PAY_URL', plugin_dir_url( __FILE__ ) );
