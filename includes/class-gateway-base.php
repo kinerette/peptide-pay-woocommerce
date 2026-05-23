@@ -434,21 +434,25 @@ abstract class WC_Gateway_Peptide_Pay_Base extends WC_Payment_Gateway {
 	// ─── Shared webhook handler (HMAC-verified, registered once by the bootstrap) ─
 
 	public static function handle_webhook_authed() {
-		// Find the first active Peptide-Pay gateway that has a webhook_secret set.
-		$secret = '';
+		// Collect EVERY distinct webhook_secret configured across the active
+		// Peptide-Pay sub-gateways. We must not assume a single shared secret:
+		// a merchant can configure different secrets on different rails, and
+		// picking only the "first" one would reject a webhook signed with any
+		// other rail's secret → the order silently stays pending (lost-order
+		// class of bug). We try them all below and accept if ANY validates.
+		$secrets  = array();
 		$gateways = WC()->payment_gateways() ? WC()->payment_gateways()->payment_gateways() : array();
 		foreach ( $gateways as $gw ) {
 			if ( ! isset( $gw->id ) || 0 !== strpos( (string) $gw->id, 'peptide_pay_' ) ) {
 				continue;
 			}
 			$s = isset( $gw->webhook_secret ) ? trim( (string) $gw->webhook_secret ) : '';
-			if ( '' !== $s ) {
-				$secret = $s;
-				break;
+			if ( '' !== $s && ! in_array( $s, $secrets, true ) ) {
+				$secrets[] = $s;
 			}
 		}
 
-		if ( empty( $secret ) ) {
+		if ( empty( $secrets ) ) {
 			status_header( 500 );
 			exit( 'no secret configured' );
 		}
@@ -497,8 +501,16 @@ abstract class WC_Gateway_Peptide_Pay_Base extends WC_Payment_Gateway {
 			status_header( 401 );
 			exit( 'stale timestamp' );
 		}
-		$expected = hash_hmac( 'sha256', $ts . '.' . $raw, $secret );
-		if ( ! hash_equals( $expected, $sig ) ) {
+		$signed_payload = $ts . '.' . $raw;
+		$verified       = false;
+		foreach ( $secrets as $secret ) {
+			$expected = hash_hmac( 'sha256', $signed_payload, $secret );
+			if ( hash_equals( $expected, $sig ) ) {
+				$verified = true;
+				break;
+			}
+		}
+		if ( ! $verified ) {
 			status_header( 401 );
 			exit( 'signature mismatch' );
 		}
@@ -552,6 +564,44 @@ abstract class WC_Gateway_Peptide_Pay_Base extends WC_Payment_Gateway {
 
 		if ( 'paid' === $status && ! $order->is_paid() ) {
 			$txid = isset( $event['txid'] ) ? sanitize_text_field( $event['txid'] ) : '';
+
+			// Defensive amount + currency verification before fulfilling. The
+			// peptide-pay server is the source of truth and should only emit
+			// order.paid on a matched payment — but we double-check here so a
+			// server bug, FX slippage, or a tampered amount can never make us
+			// ship an underpaid order. Only enforced when the event actually
+			// carries an `amount`; older events without it fall through and
+			// are trusted, so we never reject a genuine payment over a missing
+			// field.
+			$paid_minor     = ( isset( $event['amount'] ) && is_numeric( $event['amount'] ) ) ? (int) round( (float) $event['amount'] ) : null;
+			$paid_ccy       = ( isset( $event['currency'] ) && is_string( $event['currency'] ) ) ? strtoupper( $event['currency'] ) : '';
+			$order_ccy      = strtoupper( (string) $order->get_currency() );
+			$expected_minor = (int) round( ( (float) $order->get_total() ) * 100 );
+
+			if ( null !== $paid_minor ) {
+				// 2% under-tolerance absorbs on-ramp rounding / FX; any
+				// overpayment is fine. Currency must match the order's
+				// (merchant-currency-end-to-end rule) when the event reports one.
+				$min_acceptable = (int) floor( $expected_minor * 0.98 );
+				$currency_ok    = ( '' === $paid_ccy || $paid_ccy === $order_ccy );
+				if ( ! $currency_ok || $paid_minor < $min_acceptable ) {
+					$order->update_status(
+						'on-hold',
+						sprintf(
+							/* translators: 1: paid minor units, 2: paid currency, 3: expected minor units, 4: order currency, 5: tx id */
+							__( 'Peptide-Pay: payment does NOT match order — held for manual review. Paid %1$d %2$s, expected ~%3$d %4$s. TX: %5$s', 'peptide-pay' ),
+							$paid_minor,
+							$paid_ccy ? $paid_ccy : '?',
+							$expected_minor,
+							$order_ccy,
+							$txid ? $txid : 'n/a'
+						)
+					);
+					status_header( 200 );
+					exit( 'amount/currency mismatch — order held for review' );
+				}
+			}
+
 			$order->payment_complete( $txid );
 			$order->add_order_note(
 				sprintf(
@@ -560,6 +610,9 @@ abstract class WC_Gateway_Peptide_Pay_Base extends WC_Payment_Gateway {
 					$txid ? $txid : 'n/a'
 				)
 			);
+			if ( null === $paid_minor ) {
+				$order->add_order_note( __( 'Peptide-Pay: note — webhook carried no amount field; paid total was not independently verified.', 'peptide-pay' ) );
+			}
 		} elseif ( 'refunded' === $status ) {
 			$order->add_order_note( __( 'Peptide-Pay: refund event received (on-chain refunds are manual).', 'peptide-pay' ) );
 		} elseif ( 'failed' === $status ) {

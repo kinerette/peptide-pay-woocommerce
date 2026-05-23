@@ -75,6 +75,13 @@ class Peptide_Pay_Blocks_Support extends AbstractPaymentMethodType {
 			'description' => $this->gateway->get_description(),
 			'icon'        => $icon,
 			'supports'    => array( 'products' ),
+			// Real availability for THIS request (store currency, Smart-masking,
+			// secrets configured). The block JS gates canMakePayment on this so
+			// a currency-locked rail (UPI=INR, Interac=CAD) can't show on a
+			// mismatched-currency store, and individual rails stay hidden when
+			// the Smart gateway is enabled — mirroring the classic-checkout
+			// is_available() behaviour, which the Blocks side previously ignored.
+			'available'   => (bool) ( method_exists( $this->gateway, 'is_available' ) ? $this->gateway->is_available() : true ),
 		);
 	}
 }

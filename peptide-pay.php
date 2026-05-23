@@ -3,7 +3,7 @@
  * Plugin Name: Peptide-Pay for WooCommerce
  * Plugin URI: https://peptide-pay.com/download/woocommerce
  * Description: Accept Apple Pay, Google Pay, cards, Revolut + 11 more rails on your WooCommerce store — designed for peptides, nutra, and other high-risk merchants. 14 payment gateways in one plugin, kept in sync with the live PayGate provider list. Instant USDC payouts.
- * Version: 2.6.4
+ * Version: 2.6.5
  * Author: Peptide-Pay
  * Author URI: https://peptide-pay.com
  * License: MIT
@@ -29,7 +29,7 @@ if ( version_compare( PHP_VERSION, '7.4', '<' ) ) {
 	return;
 }
 
-define( 'PEPTIDE_PAY_VERSION', '2.6.4' );
+define( 'PEPTIDE_PAY_VERSION', '2.6.5' );
 define( 'PEPTIDE_PAY_FILE', __FILE__ );
 define( 'PEPTIDE_PAY_PATH', plugin_dir_path( __FILE__ ) );
 define( 'PEPTIDE_PAY_URL', plugin_dir_url( __FILE__ ) );
@@ -230,7 +230,14 @@ function peptide_pay_init() {
 		add_action( 'woocommerce_api_peptidepay_webhook_authed', array( 'WC_Gateway_Peptide_Pay_Base', 'handle_webhook_authed' ) );
 
 		// Block checkout JS — register every sub-gateway for WC Blocks support.
-		add_action( 'woocommerce_blocks_loaded', 'peptide_pay_register_blocks_support' );
+		// Hook `woocommerce_blocks_payment_method_type_registration` DIRECTLY
+		// (not nested inside `woocommerce_blocks_loaded`): the latter is a
+		// one-shot action WC core fires at `plugins_loaded` priority <= 10,
+		// i.e. BEFORE this init runs at priority 11 — so a deferred listener
+		// for it is attached too late and never fires, leaving the gateway
+		// invisible on Blocks checkout. The registration hook fires later,
+		// when the PaymentMethodRegistry initialises, and is safe here.
+		add_action( 'woocommerce_blocks_payment_method_type_registration', 'peptide_pay_register_blocks_support' );
 
 		// Plugin row "Settings" link → jumps to the Smart gateway's settings.
 		add_filter( 'plugin_action_links_' . plugin_basename( __FILE__ ), 'peptide_pay_action_links' );
@@ -549,31 +556,26 @@ function peptide_pay_wc_missing_notice() {
  * filter. Without this filter, a block-checkout merchant would see
  * retired providers that no longer route on the server.
  */
-function peptide_pay_register_blocks_support() {
+function peptide_pay_register_blocks_support( $payment_method_registry ) {
 	if ( ! class_exists( 'Automattic\\WooCommerce\\Blocks\\Payments\\Integrations\\AbstractPaymentMethodType' ) ) {
 		return;
 	}
 
 	require_once PEPTIDE_PAY_PATH . 'includes/class-blocks-support.php';
 
-	add_action(
-		'woocommerce_blocks_payment_method_type_registration',
-		function ( $payment_method_registry ) {
-			$live_codes      = peptide_pay_get_live_provider_codes();
-			$class_map       = peptide_pay_class_to_code();
-			$show_individual = peptide_pay_show_individual_gateways();
-			foreach ( $class_map as $cls => $code ) {
-				if ( ! class_exists( $cls ) ) {
-					continue;
-				}
-				if ( is_array( $live_codes ) && ! in_array( $code, $live_codes, true ) ) {
-					continue;
-				}
-				if ( ! $show_individual && 'gateway' !== $code ) {
-					continue;
-				}
-				$payment_method_registry->register( new Peptide_Pay_Blocks_Support( $cls ) );
-			}
+	$live_codes      = peptide_pay_get_live_provider_codes();
+	$class_map       = peptide_pay_class_to_code();
+	$show_individual = peptide_pay_show_individual_gateways();
+	foreach ( $class_map as $cls => $code ) {
+		if ( ! class_exists( $cls ) ) {
+			continue;
 		}
-	);
+		if ( is_array( $live_codes ) && ! in_array( $code, $live_codes, true ) ) {
+			continue;
+		}
+		if ( ! $show_individual && 'gateway' !== $code ) {
+			continue;
+		}
+		$payment_method_registry->register( new Peptide_Pay_Blocks_Support( $cls ) );
+	}
 }

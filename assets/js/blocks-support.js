@@ -62,7 +62,10 @@
 			ariaLabel: decodeEntities(data.title || data.id),
 			content: createElement(Content),
 			edit: createElement(Content),
-			canMakePayment: function () { return true; },
+			// Honour the server-computed availability (currency lock, Smart
+			// masking, secrets set). Defaults to true when the flag is absent
+			// so older payloads keep rendering.
+			canMakePayment: function () { return data.available !== false; },
 			supports: { features: (data.supports && data.supports.length) ? data.supports : ['products'] },
 		});
 	});
