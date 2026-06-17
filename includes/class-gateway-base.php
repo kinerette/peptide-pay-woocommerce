@@ -140,7 +140,7 @@ abstract class WC_Gateway_Peptide_Pay_Base extends WC_Payment_Gateway {
 				'type'        => 'text',
 				'description' => sprintf(
 					/* translators: %1$s = opening <a>, %2$s = closing </a> for the Peptide-Pay dashboard link. */
-					__( 'Copy this URL into %1$speptide-pay.com/app/api-keys%2$s when creating your webhook. The plugin already sends this URL with each checkout — this field is read-only, just for your reference.', 'peptide-pay' ),
+					__( 'This is the URL the plugin already sends automatically on every checkout. You do NOT need to create or register a webhook anywhere — just keep your API key + secret filled in. Shown here read-only, only for your reference. (Manage your keys at %1$speptide-pay.com/app/api-keys%2$s.)', 'peptide-pay' ),
 					$link_open,
 					'</a>'
 				),
@@ -156,7 +156,7 @@ abstract class WC_Gateway_Peptide_Pay_Base extends WC_Payment_Gateway {
 				'type'        => 'password',
 				'description' => sprintf(
 					/* translators: %1$s = opening <a>, %2$s = closing </a> for the Peptide-Pay dashboard link. */
-					__( 'Required. From the same %1$speptide-pay.com/app/api-keys%2$s page, copy the whsec_ value shown when you create the webhook. Used for HMAC-SHA256 verification.', 'peptide-pay' ),
+					__( 'Required. Your webhook secret was shown once at signup. Lost it? Reveal it anytime at %1$speptide-pay.com/app/api-keys%2$s (no need to rotate). Paste it here. Used for HMAC-SHA256 verification.', 'peptide-pay' ),
 					$link_open,
 					'</a>'
 				),
@@ -227,6 +227,10 @@ abstract class WC_Gateway_Peptide_Pay_Base extends WC_Payment_Gateway {
 		if ( $is_enabled && ( '' === $api_key || '' === $ws ) ) {
 			WC_Admin_Settings::add_error( __( 'Peptide-Pay: API Key and Webhook Secret are required to enable this gateway. Get both at peptide-pay.com/app/api-keys.', 'peptide-pay' ) );
 			return false;
+		}
+
+		if ( 0 === strpos( $api_key, 'sk_test_' ) ) {
+			WC_Admin_Settings::add_error( __( 'Peptide-Pay: You pasted a TEST key (sk_test_). For live payments paste your sk_live_ key from peptide-pay.com/app/api-keys.', 'peptide-pay' ) );
 		}
 
 		return parent::process_admin_options();
