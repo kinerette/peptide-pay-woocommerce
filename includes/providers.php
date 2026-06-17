@@ -56,18 +56,21 @@ class WC_Gateway_Peptide_Pay_Smart extends WC_Gateway_Peptide_Pay_Base {
 			'type'        => 'select',
 			'description' => __( 'Smart (recommended): customer picks their preferred on-ramp on our hosted page. Direct: skip the selection page and send the customer straight to the chosen provider.', 'peptide-pay' ),
 			'default'     => 'gateway',
+			// Only live, non-blacklisted providers are offered here. The
+			// revolut / binance / alchemypay / sardine / rampnetwork rails are
+			// in the server-side PROVIDER_BLACKLIST (see peptide_pay_class_to_code()
+			// in peptide-pay.php) — offering them made the Smart class pass the
+			// live-API filter (code "gateway") so the gateway showed at checkout,
+			// then hard-failed at process_payment when the blacklisted provider
+			// code was posted. get_effective_provider_code() below additionally
+			// validates the saved value against the live/known set as a backstop.
 			'options'     => array(
 				'gateway'     => __( 'Smart — show all providers (recommended)', 'peptide-pay' ),
 				'moonpay'     => __( 'Direct → Moonpay', 'peptide-pay' ),
-				'revolut'     => __( 'Direct → Revolut Pay', 'peptide-pay' ),
 				'simplex'     => __( 'Direct → Simplex', 'peptide-pay' ),
 				'banxa'       => __( 'Direct → Banxa', 'peptide-pay' ),
 				'transak'     => __( 'Direct → Transak', 'peptide-pay' ),
-				'binance'     => __( 'Direct → Binance Pay', 'peptide-pay' ),
 				'cryptocom'   => __( 'Direct → Crypto.com Pay', 'peptide-pay' ),
-				'alchemypay'  => __( 'Direct → AlchemyPay', 'peptide-pay' ),
-				'sardine'     => __( 'Direct → Sardine', 'peptide-pay' ),
-				'rampnetwork' => __( 'Direct → Ramp Network', 'peptide-pay' ),
 				'bitnovo'     => __( 'Direct → Bitnovo', 'peptide-pay' ),
 				'interac'     => __( 'Direct → Interac (Canada)', 'peptide-pay' ),
 				'upi'         => __( 'Direct → UPI (India)', 'peptide-pay' ),
@@ -182,7 +185,32 @@ class WC_Gateway_Peptide_Pay_Smart extends WC_Gateway_Peptide_Pay_Base {
 
 	protected function get_effective_provider_code() {
 		$mode = (string) $this->get_option( 'provider_mode', 'gateway' );
-		return '' !== $mode ? $mode : 'gateway';
+		if ( '' === $mode || 'gateway' === $mode ) {
+			return 'gateway';
+		}
+
+		// Validate the chosen direct-mode provider against the known/live set
+		// before sending it to /checkout/init. A merchant who saved a now-
+		// blacklisted/retired rail (or one missing from the live API) must not
+		// post a dead provider code that hard-fails at checkout — fall back to
+		// the Smart hosted page ("gateway"), which always works.
+		$known = function_exists( 'peptide_pay_class_to_code' )
+			? array_values( peptide_pay_class_to_code() )
+			: array( 'gateway' );
+
+		$live = function_exists( 'peptide_pay_get_live_provider_codes' )
+			? peptide_pay_get_live_provider_codes()
+			: null;
+
+		// The live API may be unreachable (returns null) — in that case trust
+		// the static known set only, never widen it. If live data is present,
+		// the chosen rail must be in BOTH the known map and the live list.
+		$ok = in_array( $mode, $known, true );
+		if ( is_array( $live ) ) {
+			$ok = $ok && in_array( $mode, $live, true );
+		}
+
+		return $ok ? $mode : 'gateway';
 	}
 
 	public function process_admin_options() {

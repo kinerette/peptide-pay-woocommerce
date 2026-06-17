@@ -16,6 +16,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 abstract class WC_Gateway_Peptide_Pay_Base extends WC_Payment_Gateway {
 
+	/** WP-Cron hook for the recurring status-reconciliation sweep (P0-4). */
+	const RECONCILE_CRON_HOOK = 'peptide_pay_reconcile';
+
 	/** Provider code sent to /api/v1/checkout/init (e.g. "moonpay", "revolut", "gateway", "crypto"). */
 	protected $provider_code = 'gateway';
 
@@ -58,7 +61,7 @@ abstract class WC_Gateway_Peptide_Pay_Base extends WC_Payment_Gateway {
 		$this->has_fields         = false;
 		$this->method_title       = $this->provider_method_title;
 		$this->method_description = $this->provider_method_description;
-		$this->supports           = array( 'products' );
+		$this->supports           = array( 'products', 'refunds' );
 
 		// Default icon precedence: per-gateway "Icon URL" setting →
 		// `peptide_pay_icon_<provider>` filter (dev override) → bundled
@@ -286,10 +289,15 @@ abstract class WC_Gateway_Peptide_Pay_Base extends WC_Payment_Gateway {
 		}
 
 		// Local dev / staging bypass. Classic WC_Payment_Gateway::is_available()
-		// hides gateways on non-HTTPS sites, which breaks the entire test loop
-		// on WP_DEBUG installs (wp-sandbox, Playground, TasteWP preview, etc.).
-		// Skip the parent's SSL gate when we explicitly opted into debug mode.
-		if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+		// hides gateways on non-HTTPS sites, which breaks the test loop on
+		// sandbox installs (Playground, TasteWP preview, etc.). Previously this
+		// skipped the parent's SSL gate whenever WP_DEBUG was on — far too
+		// broad, since many live stores run with WP_DEBUG enabled, which would
+		// expose the gateway over plain HTTP. Gate it instead on an explicit,
+		// dedicated opt-in constant the merchant must set in wp-config.php
+		// (define('PEPTIDE_PAY_ALLOW_INSECURE', true);). On a normal HTTPS
+		// store this branch never runs and the parent SSL check still applies.
+		if ( defined( 'PEPTIDE_PAY_ALLOW_INSECURE' ) && PEPTIDE_PAY_ALLOW_INSECURE ) {
 			return true;
 		}
 
@@ -305,6 +313,26 @@ abstract class WC_Gateway_Peptide_Pay_Base extends WC_Payment_Gateway {
 	}
 
 	public function process_payment( $order_id ) {
+		// Wrap the whole flow so a non-UTF-8 product name, an unexpected API
+		// shape, or any other \Throwable returns a clean WC checkout failure
+		// (re-enabled button + retry notice) instead of a fatal that blanks
+		// the AJAX checkout response. The customer can always retry.
+		try {
+			return $this->do_process_payment( $order_id );
+		} catch ( \Throwable $e ) {
+			$this->log_error( 'process_payment exception: ' . $e->getMessage() );
+			wc_add_notice( __( 'Something went wrong starting the payment. Please try again.', 'peptide-pay' ), 'error' );
+			return array( 'result' => 'failure' );
+		}
+	}
+
+	/**
+	 * Core payment flow, wrapped by process_payment()'s try/catch.
+	 *
+	 * @param int $order_id
+	 * @return array
+	 */
+	protected function do_process_payment( $order_id ) {
 		$order = wc_get_order( $order_id );
 		if ( ! $order ) {
 			wc_add_notice( __( 'Order not found.', 'peptide-pay' ), 'error' );
@@ -313,7 +341,7 @@ abstract class WC_Gateway_Peptide_Pay_Base extends WC_Payment_Gateway {
 
 		if ( empty( $this->api_key ) ) {
 			wc_add_notice( __( 'Peptide-Pay is not configured: missing API key. Contact the shop admin.', 'peptide-pay' ), 'error' );
-			$this->log( 'Missing api_key.' );
+			$this->log_error( 'Missing api_key — payment cannot start for order ' . $order_id . '.' );
 			return array( 'result' => 'failure' );
 		}
 
@@ -379,17 +407,28 @@ abstract class WC_Gateway_Peptide_Pay_Base extends WC_Payment_Gateway {
 
 		$headers['Authorization'] = 'Bearer ' . $this->api_key;
 
+		// Assert the payload serialises before we send it. A non-UTF-8 product
+		// name (`get_name()` above) can make wp_json_encode() return false,
+		// which would otherwise post an empty body and surface as a confusing
+		// server-side error. Fail fast with a clean retry message + a log line.
+		$json = wp_json_encode( $payload );
+		if ( false === $json ) {
+			$this->log_error( 'checkout/init payload failed to JSON-encode for order ' . $order_id . ' (likely a non-UTF-8 product name).' );
+			wc_add_notice( __( 'Could not prepare the payment. Please try again or contact the shop admin.', 'peptide-pay' ), 'error' );
+			return array( 'result' => 'failure' );
+		}
+
 		$response = wp_remote_post(
 			PEPTIDE_PAY_API_BASE . '/checkout/init',
 			array(
 				'timeout' => 30,
 				'headers' => $headers,
-				'body'    => wp_json_encode( $payload ),
+				'body'    => $json,
 			)
 		);
 
 		if ( is_wp_error( $response ) ) {
-			$this->log( 'checkout/init wp_error: ' . $response->get_error_message() );
+			$this->log_error( 'checkout/init wp_error: ' . $response->get_error_message() );
 			wc_add_notice( __( 'Unable to reach payment provider. Please try again.', 'peptide-pay' ), 'error' );
 			return array( 'result' => 'failure' );
 		}
@@ -399,7 +438,7 @@ abstract class WC_Gateway_Peptide_Pay_Base extends WC_Payment_Gateway {
 
 		if ( $code < 200 || $code >= 300 || empty( $body['url'] ) || empty( $body['id'] ) ) {
 			$msg = is_array( $body ) && ! empty( $body['error'] ) ? $body['error'] : 'unknown error';
-			$this->log( 'checkout/init http ' . $code . ' body=' . wp_json_encode( $body ) );
+			$this->log_error( 'checkout/init http ' . $code . ' body=' . wp_json_encode( $body ) );
 			wc_add_notice( sprintf( /* translators: %s: error message */ __( 'Payment init failed: %s', 'peptide-pay' ), esc_html( $msg ) ), 'error' );
 			return array( 'result' => 'failure' );
 		}
@@ -411,7 +450,7 @@ abstract class WC_Gateway_Peptide_Pay_Base extends WC_Payment_Gateway {
 		// future API hiccup surfaces as a real error instead of a void.
 		$redirect_url = esc_url_raw( (string) $body['url'] );
 		if ( '' === $redirect_url || ! preg_match( '~^https?://~i', $redirect_url ) ) {
-			$this->log( 'checkout/init returned 200 but redirect URL invalid: ' . wp_json_encode( $body ) );
+			$this->log_error( 'checkout/init returned 200 but redirect URL invalid: ' . wp_json_encode( $body ) );
 			wc_add_notice( __( 'Payment provider returned an invalid checkout URL. Please try again or contact support.', 'peptide-pay' ), 'error' );
 			return array( 'result' => 'failure' );
 		}
@@ -461,6 +500,14 @@ abstract class WC_Gateway_Peptide_Pay_Base extends WC_Payment_Gateway {
 		if ( empty( $raw ) ) {
 			status_header( 400 );
 			exit( 'empty body' );
+		}
+
+		// Reject oversized bodies before HMAC/JSON work. A legitimate event is a
+		// few KB; capping at 64 KB bounds the cost of hashing/decoding an
+		// attacker-supplied payload (DoS hardening) without affecting real events.
+		if ( strlen( $raw ) > 65536 ) {
+			status_header( 413 );
+			exit( 'payload too large' );
 		}
 
 		// Server sends header "X-PeptidePay-Signature" (new format, v2.0.3+).
@@ -562,67 +609,445 @@ abstract class WC_Gateway_Peptide_Pay_Base extends WC_Payment_Gateway {
 			exit( 'order gone' );
 		}
 
-		if ( 'paid' === $status && ! $order->is_paid() ) {
-			$txid = isset( $event['txid'] ) ? sanitize_text_field( $event['txid'] ) : '';
+		// ─── Bind the event to THIS order's stored session before fulfilling ───
+		// HMAC proves the body came from someone holding the shared secret, but
+		// it does NOT prove the event belongs to this order_id: a body signed
+		// with the same secret for a different/replayed order could otherwise
+		// fulfil the wrong WC order. Require the event's session id to match the
+		// order's stored `_peptide_pay_session_id`, OR the event metadata's
+		// `wc_order_key` to match this order's key. We enforce this only when the
+		// event actually carries a binding field — older events without either
+		// fall through and are trusted (we never reject a genuine payment over a
+		// missing field), but a present-and-mismatched binding is hard-rejected.
+		$event_session_id = isset( $event['session_id'] ) ? sanitize_text_field( (string) $event['session_id'] ) : '';
+		$stored_session   = (string) $order->get_meta( '_peptide_pay_session_id' );
+		$event_order_key  = ( isset( $event['metadata'] ) && is_array( $event['metadata'] ) && isset( $event['metadata']['wc_order_key'] ) )
+			? sanitize_text_field( (string) $event['metadata']['wc_order_key'] )
+			: '';
 
-			// Defensive amount + currency verification before fulfilling. The
-			// peptide-pay server is the source of truth and should only emit
-			// order.paid on a matched payment — but we double-check here so a
-			// server bug, FX slippage, or a tampered amount can never make us
-			// ship an underpaid order. Only enforced when the event actually
-			// carries an `amount`; older events without it fall through and
-			// are trusted, so we never reject a genuine payment over a missing
-			// field.
-			$paid_minor     = ( isset( $event['amount'] ) && is_numeric( $event['amount'] ) ) ? (int) round( (float) $event['amount'] ) : null;
-			$paid_ccy       = ( isset( $event['currency'] ) && is_string( $event['currency'] ) ) ? strtoupper( $event['currency'] ) : '';
-			$order_ccy      = strtoupper( (string) $order->get_currency() );
-			$expected_minor = (int) round( ( (float) $order->get_total() ) * 100 );
+		$has_binding   = ( '' !== $event_session_id ) || ( '' !== $event_order_key );
+		$binding_match = false;
+		if ( '' !== $event_session_id && '' !== $stored_session && hash_equals( $stored_session, $event_session_id ) ) {
+			$binding_match = true;
+		}
+		if ( '' !== $event_order_key && hash_equals( (string) $order->get_order_key(), $event_order_key ) ) {
+			$binding_match = true;
+		}
 
-			if ( null !== $paid_minor ) {
-				// 2% under-tolerance absorbs on-ramp rounding / FX; any
-				// overpayment is fine. Currency must match the order's
-				// (merchant-currency-end-to-end rule) when the event reports one.
-				$min_acceptable = (int) floor( $expected_minor * 0.98 );
-				$currency_ok    = ( '' === $paid_ccy || $paid_ccy === $order_ccy );
-				if ( ! $currency_ok || $paid_minor < $min_acceptable ) {
-					$order->update_status(
-						'on-hold',
-						sprintf(
-							/* translators: 1: paid minor units, 2: paid currency, 3: expected minor units, 4: order currency, 5: tx id */
-							__( 'Peptide-Pay: payment does NOT match order — held for manual review. Paid %1$d %2$s, expected ~%3$d %4$s. TX: %5$s', 'peptide-pay' ),
-							$paid_minor,
-							$paid_ccy ? $paid_ccy : '?',
-							$expected_minor,
-							$order_ccy,
-							$txid ? $txid : 'n/a'
-						)
-					);
-					status_header( 200 );
-					exit( 'amount/currency mismatch — order held for review' );
-				}
-			}
-
-			$order->payment_complete( $txid );
+		if ( $has_binding && ! $binding_match ) {
 			$order->add_order_note(
 				sprintf(
-					/* translators: %s: Polygon transaction id */
-					__( 'Peptide-Pay payment received (authed). TX: %s', 'peptide-pay' ),
-					$txid ? $txid : 'n/a'
+					/* translators: 1: event session id, 2: order's stored session id */
+					__( 'Peptide-Pay: webhook IGNORED — event session/order-key does not match this order (event session: %1$s, stored: %2$s). Possible cross-order/replayed event. Not fulfilled.', 'peptide-pay' ),
+					$event_session_id ? $event_session_id : 'n/a',
+					$stored_session ? $stored_session : 'n/a'
 				)
 			);
-			if ( null === $paid_minor ) {
-				$order->add_order_note( __( 'Peptide-Pay: note — webhook carried no amount field; paid total was not independently verified.', 'peptide-pay' ) );
+			status_header( 200 );
+			exit( 'session/order binding mismatch — not fulfilled' );
+		}
+
+		if ( 'paid' === $status ) {
+			// Shared, idempotent fulfilment path — also used by the status
+			// reconciliation backstop (maybe_complete_from_status). Returns a
+			// short result code; the webhook maps that to an HTTP status below.
+			$result = self::fulfil_paid_event( $order, $event, 'authed' );
+			if ( 'mismatch' === $result ) {
+				status_header( 200 );
+				exit( 'amount/currency mismatch — order held for review' );
 			}
 		} elseif ( 'refunded' === $status ) {
-			$order->add_order_note( __( 'Peptide-Pay: refund event received (on-chain refunds are manual).', 'peptide-pay' ) );
+			self::reflect_refund_event( $order, $event );
 		} elseif ( 'failed' === $status ) {
-			$order->update_status( 'failed', __( 'Peptide-Pay: payment failed.', 'peptide-pay' ) );
+			// Guard against a late / out-of-order `order.failed` flipping an
+			// order that's already paid, completed or refunded. Only an order
+			// that never reached a settled state may be marked failed — so a
+			// retry that succeeded (or a webhook arriving out of sequence)
+			// can't silently fail a paid order.
+			if ( ! $order->is_paid() && ! $order->has_status( array( 'processing', 'completed', 'refunded' ) ) ) {
+				$order->update_status( 'failed', __( 'Peptide-Pay: payment failed.', 'peptide-pay' ) );
+			} else {
+				$order->add_order_note( __( 'Peptide-Pay: received a "failed" event for an already-settled order — ignored (kept current status).', 'peptide-pay' ) );
+			}
 		}
 
 		status_header( 200 );
 		exit( 'ok' );
 	}
 
+	/**
+	 * Idempotent "mark this order paid" routine shared by the webhook and the
+	 * status-reconciliation backstop (maybe_complete_from_status). Safe to call
+	 * twice: the is_paid() guard short-circuits an already-paid order, so a
+	 * webhook + a reconciliation pass that race never double-fulfil.
+	 *
+	 * Performs the same defensive amount + currency verification as before:
+	 * only enforced when $event carries a numeric `amount` (older/sparse status
+	 * payloads without it are trusted), an underpayment beyond 2% tolerance or a
+	 * currency mismatch puts the order on-hold for manual review instead of
+	 * completing it. Never marks paid on ambiguous data.
+	 *
+	 * @param WC_Order $order
+	 * @param array    $event  Webhook event OR normalized status payload.
+	 * @param string   $source 'authed' (webhook) or 'reconcile' (status poll) — note text only.
+	 * @return string 'completed' | 'already' | 'mismatch'
+	 */
+	protected static function fulfil_paid_event( $order, $event, $source = 'authed' ) {
+		if ( $order->is_paid() ) {
+			return 'already';
+		}
+
+		$txid = isset( $event['txid'] ) ? sanitize_text_field( (string) $event['txid'] ) : '';
+
+		// Defensive amount + currency verification before fulfilling. The
+		// peptide-pay server is the source of truth and should only report
+		// paid on a matched payment — but we double-check here so a server
+		// bug, FX slippage, or a tampered amount can never make us ship an
+		// underpaid order. Only enforced when the payload actually carries an
+		// `amount`; payloads without it fall through and are trusted, so we
+		// never reject a genuine payment over a missing field.
+		$paid_minor     = ( isset( $event['amount'] ) && is_numeric( $event['amount'] ) ) ? (int) round( (float) $event['amount'] ) : null;
+		$paid_ccy       = ( isset( $event['currency'] ) && is_string( $event['currency'] ) ) ? strtoupper( $event['currency'] ) : '';
+		$order_ccy      = strtoupper( (string) $order->get_currency() );
+		$expected_minor = (int) round( ( (float) $order->get_total() ) * 100 );
+
+		if ( null !== $paid_minor ) {
+			// 2% under-tolerance absorbs on-ramp rounding / FX; any
+			// overpayment is fine. Currency must match the order's
+			// (merchant-currency-end-to-end rule) when the payload reports one.
+			$min_acceptable = (int) floor( $expected_minor * 0.98 );
+			$currency_ok    = ( '' === $paid_ccy || $paid_ccy === $order_ccy );
+			if ( ! $currency_ok || $paid_minor < $min_acceptable ) {
+				$order->update_status(
+					'on-hold',
+					sprintf(
+						/* translators: 1: paid minor units, 2: paid currency, 3: expected minor units, 4: order currency, 5: tx id */
+						__( 'Peptide-Pay: payment does NOT match order — held for manual review. Paid %1$d %2$s, expected ~%3$d %4$s. TX: %5$s', 'peptide-pay' ),
+						$paid_minor,
+						$paid_ccy ? $paid_ccy : '?',
+						$expected_minor,
+						$order_ccy,
+						$txid ? $txid : 'n/a'
+					)
+				);
+				return 'mismatch';
+			}
+		}
+
+		$order->payment_complete( $txid );
+		$order->add_order_note(
+			sprintf(
+				/* translators: 1: source (authed webhook / reconciliation), 2: transaction id */
+				__( 'Peptide-Pay payment received (%1$s). TX: %2$s', 'peptide-pay' ),
+				'reconcile' === $source ? __( 'status reconciliation', 'peptide-pay' ) : __( 'authed', 'peptide-pay' ),
+				$txid ? $txid : 'n/a'
+			)
+		);
+		if ( null === $paid_minor ) {
+			$order->add_order_note( __( 'Peptide-Pay: note — payload carried no amount field; paid total was not independently verified.', 'peptide-pay' ) );
+		}
+		return 'completed';
+	}
+
+	/**
+	 * Reflect an `order.refunded` webhook into WooCommerce. Previously this was
+	 * a bare order note, so a refund issued on the Peptide-Pay side never moved
+	 * the WC order out of its paid status — leaving the merchant's books wrong.
+	 *
+	 * We create a WC refund for the reported amount (idempotent: if the order
+	 * already has refunds totalling >= the reported amount we only add a note),
+	 * which moves the order to `refunded` when fully refunded and restores
+	 * stock / totals through WC's own pipeline. On any failure we fall back to
+	 * a note so a malformed payload never throws inside the webhook handler.
+	 *
+	 * @param WC_Order $order
+	 * @param array    $event
+	 * @return void
+	 */
+	protected static function reflect_refund_event( $order, $event ) {
+		// Amount is sent in minor units (same scale as checkout/init). Convert
+		// back to the store's major-unit decimal for wc_create_refund(). When the
+		// payload omits an amount, refund the full remaining total.
+		$already   = (float) $order->get_total_refunded();
+		$order_tot = (float) $order->get_total();
+		$remaining = max( 0.0, $order_tot - $already );
+
+		$amount = $remaining;
+		if ( isset( $event['amount'] ) && is_numeric( $event['amount'] ) ) {
+			$amount = round( ( (float) $event['amount'] ) / 100, wc_get_price_decimals() );
+			// Never refund more than what's still refundable on the order.
+			if ( $amount > $remaining ) {
+				$amount = $remaining;
+			}
+		}
+
+		$txid = isset( $event['txid'] ) ? sanitize_text_field( (string) $event['txid'] ) : '';
+
+		if ( $amount <= 0 ) {
+			$order->add_order_note(
+				sprintf(
+					/* translators: %s: transaction id */
+					__( 'Peptide-Pay: refund event received but order is already fully refunded. TX: %s', 'peptide-pay' ),
+					$txid ? $txid : 'n/a'
+				)
+			);
+			return;
+		}
+
+		if ( ! function_exists( 'wc_create_refund' ) ) {
+			$order->add_order_note( __( 'Peptide-Pay: refund event received (could not auto-create WC refund — wc_create_refund unavailable). Please refund manually.', 'peptide-pay' ) );
+			return;
+		}
+
+		$refund = wc_create_refund(
+			array(
+				'order_id' => $order->get_id(),
+				'amount'   => $amount,
+				'reason'   => sprintf(
+					/* translators: %s: transaction id */
+					__( 'Peptide-Pay refund webhook. TX: %s', 'peptide-pay' ),
+					$txid ? $txid : 'n/a'
+				),
+			)
+		);
+
+		if ( is_wp_error( $refund ) ) {
+			$order->add_order_note(
+				sprintf(
+					/* translators: %s: error message */
+					__( 'Peptide-Pay: refund event received but auto-refund failed (%s). Please refund manually.', 'peptide-pay' ),
+					$refund->get_error_message()
+				)
+			);
+		}
+	}
+
+	/**
+	 * WC refund hook (merchant clicks "Refund" in wp-admin). On-ramp refunds
+	 * are settled on the Peptide-Pay side, not via a card-processor API, so we
+	 * record the WC-side refund (which this return value commits) and leave a
+	 * note instructing the merchant to action the actual payout in the
+	 * Peptide-Pay dashboard. Returning true lets WC create the refund line /
+	 * adjust the order total without us pretending to have moved money.
+	 *
+	 * @param int        $order_id
+	 * @param float|null $amount
+	 * @param string     $reason
+	 * @return bool
+	 */
+	public function process_refund( $order_id, $amount = null, $reason = '' ) {
+		$order = wc_get_order( $order_id );
+		if ( ! $order ) {
+			return new WP_Error( 'peptide_pay_refund', __( 'Order not found.', 'peptide-pay' ) );
+		}
+		$order->add_order_note(
+			sprintf(
+				/* translators: 1: refund amount, 2: reason */
+				__( 'Peptide-Pay: WC refund recorded for %1$s. Action the payout in the Peptide-Pay dashboard — on-ramp refunds are settled there, not automatically. Reason: %2$s', 'peptide-pay' ),
+				wc_price( null === $amount ? $order->get_total() : (float) $amount ),
+				'' !== $reason ? $reason : __( '(none given)', 'peptide-pay' )
+			)
+		);
+		return true;
+	}
+
+	/**
+	 * Reconciliation backstop (P0-4). Fetches authoritative status for the
+	 * order's stored Peptide-Pay session from the API and, when the session is
+	 * reported paid, routes through the SAME idempotent fulfilment path as the
+	 * webhook (fulfil_paid_event). Safe to call repeatedly — an already-paid
+	 * order short-circuits. Fails safe: never marks paid on an ambiguous or
+	 * failed status response (network error, non-2xx, unparseable body, or any
+	 * status other than an explicit paid/completed).
+	 *
+	 * Wired to:
+	 *   (a) woocommerce_thankyou for unpaid peptide_pay_* orders, and
+	 *   (b) a recurring cron (peptide_pay_reconcile) over pending/on-hold
+	 *       Peptide-Pay orders younger than 24h.
+	 *
+	 * @param WC_Order $order
+	 * @return bool True if the order ended up paid as a result of this call.
+	 */
+	public function maybe_complete_from_status( $order ) {
+		if ( ! $order instanceof WC_Order ) {
+			return false;
+		}
+		if ( $order->is_paid() ) {
+			return true; // Nothing to do — already fulfilled (webhook or prior poll).
+		}
+
+		$session_id = (string) $order->get_meta( '_peptide_pay_session_id' );
+		if ( '' === $session_id ) {
+			return false; // No session to reconcile against (order never reached checkout/init).
+		}
+		if ( '' === $this->api_key ) {
+			return false; // Can't authenticate the status call.
+		}
+
+		// ── Status endpoint ──────────────────────────────────────────────
+		// VERIFIED against the server (src/app/api/v1/sessions/[id]/route.ts):
+		// the authoritative per-session status is GET {API_BASE}/sessions/{id}.
+		// It accepts our Bearer API key (and 403s if the session doesn't belong
+		// to this merchant), re-polls PayGate as a lost-IPN safety net, and
+		// returns { id, status, amount, currency, paid_at, paid_provider, txid }.
+		// `status` becomes 'paid' once settled.
+		$status_url = PEPTIDE_PAY_API_BASE . '/sessions/' . rawurlencode( $session_id );
+
+		$response = wp_remote_get(
+			$status_url,
+			array(
+				'timeout' => 15,
+				'headers' => array(
+					'Accept'              => 'application/json',
+					'Authorization'       => 'Bearer ' . $this->api_key,
+					'User-Agent'          => 'peptide-pay-woocommerce/' . PEPTIDE_PAY_VERSION,
+					'X-PeptidePay-Source' => 'woocommerce-plugin',
+				),
+			)
+		);
+
+		if ( is_wp_error( $response ) ) {
+			$this->log( 'reconcile status wp_error for session ' . $session_id . ': ' . $response->get_error_message() );
+			return false; // Fail safe — never mark paid on a network error.
+		}
+
+		$code = (int) wp_remote_retrieve_response_code( $response );
+		if ( $code < 200 || $code >= 300 ) {
+			$this->log( 'reconcile status http ' . $code . ' for session ' . $session_id );
+			return false; // Fail safe — non-2xx is ambiguous.
+		}
+
+		$body = json_decode( (string) wp_remote_retrieve_body( $response ), true );
+		if ( ! is_array( $body ) ) {
+			$this->log( 'reconcile status unparseable body for session ' . $session_id );
+			return false; // Fail safe.
+		}
+
+		// Normalize the status field. Accept the same vocabulary the webhook
+		// uses ("paid"); also accept "completed"/"succeeded" defensively in case
+		// the status endpoint reports a session lifecycle term. Anything else
+		// (pending, processing, failed, expired, unknown) is NOT a paid signal.
+		$raw_status = '';
+		if ( isset( $body['status'] ) && is_string( $body['status'] ) ) {
+			$raw_status = strtolower( trim( $body['status'] ) );
+		}
+		$paid_terms = array( 'paid', 'completed', 'succeeded', 'success' );
+		if ( ! in_array( $raw_status, $paid_terms, true ) ) {
+			return false; // Fail safe — only fulfil on an explicit paid status.
+		}
+
+		// Bind the status response to this order's stored session (defence in
+		// depth — the URL already keys on session_id, but verify any echoed id).
+		if ( isset( $body['id'] ) && is_string( $body['id'] ) && '' !== $body['id'] ) {
+			if ( ! hash_equals( $session_id, sanitize_text_field( $body['id'] ) ) ) {
+				$this->log( 'reconcile status id mismatch for session ' . $session_id );
+				return false;
+			}
+		}
+
+		// Hand off to the shared idempotent fulfilment path. Pass through any
+		// amount/currency the status response carries so the same defensive
+		// verification runs (under-paid → on-hold, never silently completed).
+		$result = self::fulfil_paid_event( $order, $body, 'reconcile' );
+		return ( 'completed' === $result || 'already' === $result );
+	}
+
+	/**
+	 * woocommerce_thankyou hook: when a customer lands on the return page for
+	 * an unpaid Peptide-Pay order, proactively reconcile its status so a dropped
+	 * webhook doesn't leave a paid order stuck on "pending".
+	 *
+	 * @param int $order_id
+	 * @return void
+	 */
+	public static function thankyou_reconcile( $order_id ) {
+		$order = wc_get_order( $order_id );
+		if ( ! $order || $order->is_paid() ) {
+			return;
+		}
+		if ( 0 !== strpos( (string) $order->get_payment_method(), 'peptide_pay_' ) ) {
+			return;
+		}
+		$gateway = self::get_gateway_for_order( $order );
+		if ( $gateway ) {
+			$gateway->maybe_complete_from_status( $order );
+		}
+	}
+
+	/**
+	 * Recurring reconciliation (cron callback). Sweeps pending/on-hold
+	 * Peptide-Pay orders younger than 24h and reconciles each against the API,
+	 * so a permanently-dropped webhook still gets caught within an hour.
+	 *
+	 * @return void
+	 */
+	public static function cron_reconcile() {
+		if ( ! function_exists( 'wc_get_orders' ) ) {
+			return;
+		}
+		$orders = wc_get_orders(
+			array(
+				'limit'        => 50,
+				'status'       => array( 'pending', 'on-hold' ),
+				'date_created' => '>' . ( time() - DAY_IN_SECONDS ),
+				'return'       => 'objects',
+			)
+		);
+		if ( empty( $orders ) ) {
+			return;
+		}
+		foreach ( $orders as $order ) {
+			if ( ! $order instanceof WC_Order || $order->is_paid() ) {
+				continue;
+			}
+			if ( 0 !== strpos( (string) $order->get_payment_method(), 'peptide_pay_' ) ) {
+				continue;
+			}
+			if ( '' === (string) $order->get_meta( '_peptide_pay_session_id' ) ) {
+				continue;
+			}
+			$gateway = self::get_gateway_for_order( $order );
+			if ( $gateway ) {
+				$gateway->maybe_complete_from_status( $order );
+			}
+		}
+	}
+
+	/**
+	 * Resolve the live gateway instance whose credentials match an order's
+	 * payment method, so reconciliation uses the right api_key. Falls back to
+	 * any configured peptide_pay_* gateway with an api_key if the exact id is
+	 * unavailable (e.g. a sub-gateway was disabled after the order was placed).
+	 *
+	 * @param WC_Order $order
+	 * @return WC_Gateway_Peptide_Pay_Base|null
+	 */
+	protected static function get_gateway_for_order( $order ) {
+		if ( ! function_exists( 'WC' ) || ! WC()->payment_gateways() ) {
+			return null;
+		}
+		$gateways  = WC()->payment_gateways()->payment_gateways();
+		$method_id = (string) $order->get_payment_method();
+
+		if ( isset( $gateways[ $method_id ] ) && $gateways[ $method_id ] instanceof WC_Gateway_Peptide_Pay_Base ) {
+			$gw = $gateways[ $method_id ];
+			if ( '' !== trim( (string) $gw->api_key ) ) {
+				return $gw;
+			}
+		}
+		foreach ( $gateways as $gw ) {
+			if ( $gw instanceof WC_Gateway_Peptide_Pay_Base && '' !== trim( (string) $gw->api_key ) ) {
+				return $gw;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Verbose request/response trace. Only written when the merchant has
+	 * explicitly enabled "Debug log" — keeps the log file small in production
+	 * but lets support capture full payloads when something is broken.
+	 */
 	protected function log( $message ) {
 		if ( ! $this->debug_log ) {
 			return;
@@ -631,4 +1056,49 @@ abstract class WC_Gateway_Peptide_Pay_Base extends WC_Payment_Gateway {
 			wc_get_logger()->info( '[' . $this->provider_code . '] ' . $message, array( 'source' => 'peptide-pay' ) );
 		}
 	}
+
+	/**
+	 * Always-on error logging for customer-facing failures (wp_error,
+	 * non-2xx, invalid redirect URL, thrown exceptions). Unlike log(), this
+	 * writes regardless of the debug_log setting — a payment that fails for
+	 * a customer must always leave a trace under WooCommerce → Status → Logs
+	 * so the merchant/support can diagnose it without first reproducing the
+	 * failure with debug mode toggled on. Routed at error() level so it
+	 * surfaces even with WC's log level filtered to errors only.
+	 */
+	protected function log_error( $message ) {
+		if ( function_exists( 'wc_get_logger' ) ) {
+			wc_get_logger()->error( '[' . $this->provider_code . '] ' . $message, array( 'source' => 'peptide-pay' ) );
+		}
+	}
+
+	/**
+	 * Wire the P0-4 reconciliation backstop. Registered here (rather than in
+	 * the main plugin bootstrap) so the whole reconciliation feature lives in
+	 * one file. Idempotent — guarded against double-registration.
+	 *
+	 *   (a) woocommerce_thankyou → re-check unpaid peptide_pay_* orders.
+	 *   (b) hourly WP-Cron sweep over pending/on-hold orders younger than 24h.
+	 */
+	public static function init_reconciliation() {
+		static $done = false;
+		if ( $done ) {
+			return;
+		}
+		$done = true;
+
+		add_action( 'woocommerce_thankyou', array( __CLASS__, 'thankyou_reconcile' ), 5 );
+
+		add_action( self::RECONCILE_CRON_HOOK, array( __CLASS__, 'cron_reconcile' ) );
+		if ( function_exists( 'wp_next_scheduled' ) && ! wp_next_scheduled( self::RECONCILE_CRON_HOOK ) ) {
+			wp_schedule_event( time() + 300, 'hourly', self::RECONCILE_CRON_HOOK );
+		}
+	}
 }
+
+// Cron hook name for the recurring reconciliation sweep (P0-4). Defined as a
+// class constant above for callers; this self-registration runs at require-time
+// (the file is loaded inside peptide_pay_init on plugins_loaded, after WC is
+// confirmed present), so the thankyou hook + hourly cron are always wired
+// without modifying the main plugin bootstrap.
+WC_Gateway_Peptide_Pay_Base::init_reconciliation();

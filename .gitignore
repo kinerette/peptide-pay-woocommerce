@@ -6,3 +6,6 @@ node_modules/
 .idea/
 .vscode/
 *.zip
+
+# internal security analysis — never publish
+HARDENING-PLAN.raw.json

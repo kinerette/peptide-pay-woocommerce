@@ -35,6 +35,31 @@
 		return val.indexOf( 'peptide_pay_' ) === 0;
 	}
 
+	// Render a WooCommerce-style error notice at the top of the checkout form
+	// and scroll it into view — same pattern WC uses for its own AJAX errors,
+	// so it picks up the active theme's notice styling. Falls back to alert()
+	// only if the checkout form isn't found.
+	function showCheckoutError( message ) {
+		var $form = $( 'form.checkout' );
+		if ( ! $form.length ) {
+			if ( typeof window.alert === 'function' ) {
+				window.alert( message );
+			}
+			return;
+		}
+		$( '.woocommerce-error, .woocommerce-NoticeGroup-checkout', $form ).remove();
+		var html =
+			'<div class="woocommerce-NoticeGroup woocommerce-NoticeGroup-checkout">' +
+			'<ul class="woocommerce-error" role="alert"><li>' +
+			$( '<div/>' ).text( message ).html() +
+			'</li></ul></div>';
+		$form.prepend( html );
+		$( 'html, body' ).animate(
+			{ scrollTop: $form.offset().top - 100 },
+			500
+		);
+	}
+
 	function setLoading( $button, label ) {
 		if ( ! $button.length ) {
 			return;
@@ -84,14 +109,17 @@
 
 		// 30s fallback — re-enable the button if WC's AJAX layer
 		// silently failed (timeout, network drop, server 5xx). Without
-		// this the customer sits forever on a spinning button.
+		// this the customer sits forever on a spinning button. Surface a
+		// real, visible checkout notice so the customer knows to retry
+		// rather than only logging to the console (which they never see).
 		FALLBACK_TIMER = setTimeout( function () {
 			clearLoading( $button );
-			if ( typeof $.fn.notice !== 'undefined' || typeof window.alert !== 'undefined' ) {
-				if ( window.console && window.console.warn ) {
-					console.warn( 'Peptide-Pay: no redirect within 30s — re-enabling button.' );
-				}
+			if ( window.console && window.console.warn ) {
+				console.warn( 'Peptide-Pay: no redirect within 30s — re-enabling button.' );
 			}
+			showCheckoutError(
+				'The payment is taking longer than expected. Please check your connection and try again.'
+			);
 		}, 30000 );
 
 		return true;

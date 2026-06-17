@@ -14,6 +14,7 @@
  * Requires PHP: 7.4
  * WC requires at least: 7.0
  * WC tested up to: 10.6
+ * Requires Plugins: woocommerce
  *
  * @package Peptide_Pay
  */
@@ -193,8 +194,11 @@ register_activation_hook( __FILE__, function () {
 	if ( ! wp_next_scheduled( PEPTIDE_PAY_LIVE_CRON_HOOK ) ) {
 		wp_schedule_event( time() + 60, 'daily', PEPTIDE_PAY_LIVE_CRON_HOOK );
 	}
-	// Warm the cache on activation so the first checkout doesn't pay the HTTP cost.
-	peptide_pay_get_live_provider_codes( true );
+	// NEVER warm the cache here with a blocking HTTP call. On hosts with no
+	// outbound network (or a firewall/WAF) a synchronous wp_remote_get inside
+	// the activation hook stalls activation and surfaces as "plugin generated
+	// unexpected output" — the #1 "couldn't install it" cause. The daily cron
+	// above + the lazy fetch on first gateway-list build populate it safely.
 } );
 register_deactivation_hook( __FILE__, function () {
 	$ts = wp_next_scheduled( PEPTIDE_PAY_LIVE_CRON_HOOK );
@@ -287,11 +291,21 @@ function peptide_pay_add_gateways( $gateways ) {
 		if ( ! class_exists( $cls ) ) {
 			continue;
 		}
-		if ( is_array( $live_codes ) && ! in_array( $code, $live_codes, true ) ) {
+		// The Smart "gateway" rail is the always-available hosted checkout.
+		// NEVER let a transient/partial live-provider response hide it — that
+		// leaves the merchant with no payment method and nothing to diagnose.
+		if ( 'gateway' !== $code && is_array( $live_codes ) && ! in_array( $code, $live_codes, true ) ) {
 			// Live API doesn't expose this provider anymore — hide it from
 			// merchants instead of letting them route customers into a
-			// broken on-ramp. We keep the class on disk so an upstream
-			// flap doesn't permanently delete merchant settings.
+			// broken on-ramp. Log unconditionally so a vanished rail is
+			// diagnosable. We keep the class on disk so an upstream flap
+			// doesn't permanently delete merchant settings.
+			if ( function_exists( 'wc_get_logger' ) ) {
+				wc_get_logger()->warning(
+					sprintf( 'Peptide-Pay: provider "%s" hidden — not in live provider list.', $code ),
+					array( 'source' => 'peptide-pay' )
+				);
+			}
 			continue;
 		}
 		// Compact view: only the Smart (gateway) row appears in WC →
@@ -570,7 +584,9 @@ function peptide_pay_register_blocks_support( $payment_method_registry ) {
 		if ( ! class_exists( $cls ) ) {
 			continue;
 		}
-		if ( is_array( $live_codes ) && ! in_array( $code, $live_codes, true ) ) {
+		// Mirror the classic filter: the Smart "gateway" rail must always be
+		// registered on Block checkout too, so it never silently disappears.
+		if ( 'gateway' !== $code && is_array( $live_codes ) && ! in_array( $code, $live_codes, true ) ) {
 			continue;
 		}
 		if ( ! $show_individual && 'gateway' !== $code ) {

@@ -35,6 +35,15 @@ class Peptide_Pay_Blocks_Support extends AbstractPaymentMethodType {
 	}
 
 	public function is_active() {
+		// Defer to the gateway's real availability (enabled + secrets set +
+		// store-currency match + Smart-masking) rather than the bare `enabled`
+		// flag, so an unconfigured or Smart-masked sub-rail isn't even
+		// registered on block checkout. Mirrors the classic-checkout gate and
+		// stops relying solely on the JS canMakePayment fallback. Guarded so a
+		// gateway without is_available() (shouldn't happen) still resolves.
+		if ( method_exists( $this->gateway, 'is_available' ) ) {
+			return (bool) $this->gateway->is_available();
+		}
 		return 'yes' === $this->gateway->enabled;
 	}
 
@@ -72,7 +81,11 @@ class Peptide_Pay_Blocks_Support extends AbstractPaymentMethodType {
 		return array(
 			'id'          => $this->gateway->id,
 			'title'       => $this->gateway->get_title(),
-			'description' => $this->gateway->get_description(),
+			// Sanitise before it reaches the block JS, which renders it via
+			// RawHTML (no escaping client-side). wp_kses_post() keeps the
+			// merchant's allowed markup (img/links/badges) but strips scripts
+			// and other unsafe tags.
+			'description' => wp_kses_post( $this->gateway->get_description() ),
 			'icon'        => $icon,
 			'supports'    => array( 'products' ),
 			// Real availability for THIS request (store currency, Smart-masking,
