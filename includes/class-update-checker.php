@@ -50,13 +50,34 @@ class WC_Peptide_Pay_Update_Checker {
 			return;
 		}
 		$canonical = plugin_basename( PEPTIDE_PAY_FILE );
-		$active    = (array) get_option( 'active_plugins', array() );
-		$dirty     = false;
+
+		// Only act when THIS plugin is part of the batch being updated. Without
+		// this gate the function rewrote `active_plugins` on EVERY plugin
+		// update, which could clobber an unrelated entry (or a separate
+		// staging copy) merely because its path contained "peptide-pay".
+		$updated = array();
+		if ( ! empty( $hook_extra['plugins'] ) && is_array( $hook_extra['plugins'] ) ) {
+			$updated = $hook_extra['plugins'];
+		} elseif ( ! empty( $hook_extra['plugin'] ) && is_string( $hook_extra['plugin'] ) ) {
+			$updated = array( $hook_extra['plugin'] );
+		}
+		if ( ! in_array( $canonical, (array) $updated, true ) ) {
+			return;
+		}
+
+		$active = (array) get_option( 'active_plugins', array() );
+		$dirty  = false;
 		foreach ( $active as $i => $p ) {
 			if ( ! is_string( $p ) ) {
 				continue;
 			}
-			if ( false !== strpos( $p, 'peptide-pay' ) && $p !== $canonical ) {
+			// Only rewrite entries that are clearly THIS plugin's main file
+			// (path ending in "/peptide-pay.php") and differ from canonical.
+			// Tightened from the old "contains peptide-pay" match so a sibling
+			// plugin/copy with a similar name is never touched.
+			if ( $p !== $canonical
+				&& ( '/peptide-pay.php' === substr( $p, -16 ) || 'peptide-pay.php' === $p )
+			) {
 				$active[ $i ] = $canonical;
 				$dirty        = true;
 			}
@@ -83,11 +104,44 @@ class WC_Peptide_Pay_Update_Checker {
 		if ( ! current_user_can( 'manage_woocommerce' ) && ! current_user_can( 'install_plugins' ) ) {
 			return;
 		}
+		// CSRF protection: the force-check flushes caches and triggers a remote
+		// fetch, so it must not be drive-by-triggerable via a crafted link.
+		// Build the link with wp_nonce_url( ..., 'peptide_pay_force_check' ).
+		check_admin_referer( 'peptide_pay_force_check' );
 		delete_transient( self::CACHE_KEY );
 		delete_site_transient( 'update_plugins' );
 		add_action( 'admin_notices', function() {
 			echo '<div class="notice notice-success is-dismissible"><p>Peptide-Pay update check forced — reload the Plugins page to see the result.</p></div>';
 		} );
+	}
+
+	/**
+	 * Whitelist hosts allowed to serve the update package. The updater extracts
+	 * this archive with site privileges, so the source must be pinned.
+	 *
+	 * @return array<int,string>
+	 */
+	private static function trusted_package_hosts() {
+		return array( 'peptide-pay.com', 'www.peptide-pay.com' );
+	}
+
+	/**
+	 * True only when $url is an https:// URL whose host is in the trusted set.
+	 * Used to gate the package WP downloads + extracts on update.
+	 *
+	 * @param string $url
+	 * @return bool
+	 */
+	private static function is_trusted_package_url( $url ) {
+		$scheme = wp_parse_url( $url, PHP_URL_SCHEME );
+		if ( ! is_string( $scheme ) || 'https' !== strtolower( $scheme ) ) {
+			return false;
+		}
+		$host = wp_parse_url( $url, PHP_URL_HOST );
+		if ( ! is_string( $host ) || '' === $host ) {
+			return false;
+		}
+		return in_array( strtolower( $host ), self::trusted_package_hosts(), true );
 	}
 
 	/**
@@ -138,6 +192,25 @@ class WC_Peptide_Pay_Update_Checker {
 		$local_version  = PEPTIDE_PAY_VERSION;
 		$remote_version = (string) $info['version'];
 
+		// Validate the remote version string before trusting it in
+		// version_compare() / surfacing it in the UI. Reject anything that
+		// isn't a plain dotted-numeric version (e.g. injected markup, ranges).
+		if ( ! preg_match( '/^\d+\.\d+(\.\d+)*$/', $remote_version ) ) {
+			return $transient;
+		}
+
+		// Host-pin + HTTPS the download package. WP's updater downloads and
+		// extracts this URL with site privileges, so an attacker-controlled or
+		// MITM'd package is an RCE surface on a fund-handling plugin. Only
+		// accept https:// URLs served from peptide-pay.com (or www.). A
+		// download_url that fails the check is blanked: WP then shows the
+		// update notice but the one-click install is disabled until a valid
+		// package is published.
+		$download_url = isset( $info['download_url'] ) ? (string) $info['download_url'] : '';
+		if ( '' !== $download_url && ! self::is_trusted_package_url( $download_url ) ) {
+			$download_url = '';
+		}
+
 		// `id` must match the plugin basename WP uses internally to look up
 		// the plugin after an update — i.e. `<folder>/<main-file.php>`.
 		// Earlier releases passed `<slug>/<slug>` here, which resolved to
@@ -152,7 +225,7 @@ class WC_Peptide_Pay_Update_Checker {
 			'plugin'       => $basename,
 			'new_version'  => $remote_version,
 			'url'          => isset( $info['homepage'] ) ? (string) $info['homepage'] : 'https://peptide-pay.com',
-			'package'      => isset( $info['download_url'] ) ? (string) $info['download_url'] : '',
+			'package'      => $download_url,
 			'tested'       => isset( $info['tested'] ) ? (string) $info['tested'] : '',
 			'requires'     => isset( $info['requires'] ) ? (string) $info['requires'] : '',
 			'requires_php' => isset( $info['requires_php'] ) ? (string) $info['requires_php'] : '',
@@ -191,6 +264,12 @@ class WC_Peptide_Pay_Update_Checker {
 			return $res;
 		}
 		$sections = isset( $info['sections'] ) && is_array( $info['sections'] ) ? $info['sections'] : array();
+		// Same host-pin as inject_update(): never advertise a download link
+		// that WP would install from an untrusted host.
+		$download_link = isset( $info['download_url'] ) ? (string) $info['download_url'] : '';
+		if ( '' !== $download_link && ! self::is_trusted_package_url( $download_link ) ) {
+			$download_link = '';
+		}
 		return (object) array(
 			'name'          => isset( $info['name'] ) ? (string) $info['name'] : 'Peptide-Pay for WooCommerce',
 			'slug'          => self::PLUGIN_SLUG,
@@ -201,7 +280,7 @@ class WC_Peptide_Pay_Update_Checker {
 			'tested'        => isset( $info['tested'] ) ? (string) $info['tested'] : '',
 			'last_updated'  => isset( $info['last_updated'] ) ? (string) $info['last_updated'] : '',
 			'homepage'      => isset( $info['homepage'] ) ? (string) $info['homepage'] : 'https://peptide-pay.com',
-			'download_link' => isset( $info['download_url'] ) ? (string) $info['download_url'] : '',
+			'download_link' => $download_link,
 			'sections'      => $sections,
 			'banners'       => array(),
 		);
